@@ -1,0 +1,283 @@
+name: Legacy ARM32 runtime
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/legacy-runtime.yml"
+      - "docs/legacy-runtime.md"
+  workflow_dispatch:
+    inputs:
+      runtime_revision:
+        description: "Release revision (for example r1)"
+        required: true
+        default: "r1"
+        type: string
+      publish_release:
+        description: "Publish/update a persistent GitHub Release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: legacy-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_RUNTIME_VERSION: "16.20.2"
+  LEGACY_RUNTIME_PROFILE: "legacy-arm32-softfp-static"
+
+jobs:
+  build-runtime:
+    name: Node 16 ARMv7 softfp
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ARM cross toolchain, x86 multilib and QEMU
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabi \
+            g++-arm-linux-gnueabi \
+            binutils-arm-linux-gnueabi \
+            libc6-dev-i386 \
+            lib32stdc++-11-dev \
+            linux-libc-dev:i386 \
+            qemu-user \
+            ccache
+
+      - name: Restore packaged runtime cache
+        id: runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: artifacts/legacy-runtime
+          key: legacy-node-${{ env.NODE_RUNTIME_VERSION }}-armv7-softfp-static-${{ hashFiles('.github/workflows/legacy-runtime.yml') }}
+
+      - name: Restore compiler cache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ccache
+          key: legacy-node-ccache-${{ env.NODE_RUNTIME_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            legacy-node-ccache-${{ env.NODE_RUNTIME_VERSION }}-
+
+      - name: Build fully static ARM32 softfp Node.js
+        if: steps.runtime-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Keep build paths short: V8 archives contain hundreds of object paths and
+          # can otherwise exceed Linux ARG_MAX when the repository name is long.
+          workdir="/tmp/tailnettv-node-build"
+          rm -rf "${workdir}"
+          mkdir -p "${workdir}"
+
+          export CCACHE_DIR="${HOME}/.cache/ccache"
+          export CCACHE_BASEDIR="${workdir}"
+          export CCACHE_COMPILERCHECK=content
+          ccache --max-size=1G
+
+          src="node-v${NODE_RUNTIME_VERSION}"
+          archive="${src}.tar.gz"
+
+          curl --fail --location --retry 3 \
+            "https://nodejs.org/dist/v${NODE_RUNTIME_VERSION}/${archive}" \
+            --output "${workdir}/${archive}"
+
+          tar -xzf "${workdir}/${archive}" -C "${workdir}"
+          cd "${workdir}/${src}"
+
+          arm_flags="-march=armv7-a -mfpu=vfpv3 -mfloat-abi=softfp"
+
+          export CC="ccache arm-linux-gnueabi-gcc ${arm_flags}"
+          export CXX="ccache arm-linux-gnueabi-g++ ${arm_flags}"
+          export CC_host="ccache gcc"
+          export CXX_host="ccache g++"
+          export AR_host="ar"
+          export CC_target="${CC}"
+          export CXX_target="${CXX}"
+          export AR_target="arm-linux-gnueabi-ar"
+          export AS_target="arm-linux-gnueabi-as"
+          export LD_target="arm-linux-gnueabi-ld"
+          export LINK_target="${CXX}"
+          export NM_target="arm-linux-gnueabi-nm"
+          export RANLIB_target="arm-linux-gnueabi-ranlib"
+          export STRIP_target="arm-linux-gnueabi-strip"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("tools/v8_gypfiles/v8.gyp")
+          s = p.read_text()
+          old_x64 = '_toolset == "host" and host_arch == "x64" or _toolset == "target" and target_arch=="x64"'
+          new_x64 = '_toolset == "host" and host_arch == "x64" and target_arch!="arm" or _toolset == "target" and target_arch=="x64"'
+          old_ia32 = '_toolset == "host" and host_arch == "ia32" or _toolset == "target" and target_arch=="ia32"'
+          new_ia32 = '_toolset == "host" and (host_arch == "ia32" or host_arch == "x64" and target_arch=="arm") or _toolset == "target" and target_arch=="ia32"'
+
+          if old_x64 not in s or old_ia32 not in s:
+              raise SystemExit("Expected Node 16 V8 host-arch conditions not found")
+
+          s = s.replace(old_x64, new_x64, 1)
+          s = s.replace(old_ia32, new_ia32, 1)
+          p.write_text(s)
+
+          features = Path("tools/v8_gypfiles/features.gypi")
+          fs = features.read_text()
+          old_wasm = "'v8_enable_webassembly%': 1,"
+          if old_wasm not in fs:
+              raise SystemExit("Expected V8 WebAssembly feature flag not found")
+          features.write_text(fs.replace(old_wasm, "'v8_enable_webassembly%': 0,", 1))
+          PY
+
+          ./configure \
+            --dest-cpu=arm \
+            --dest-os=linux \
+            --cross-compiling \
+            --with-arm-float-abi=softfp \
+            --with-arm-fpu=vfpv3 \
+            --with-intl=none \
+            --without-inspector \
+            --without-npm \
+            --without-corepack \
+            --openssl-no-asm \
+            --fully-static
+
+          make -j2 V=0
+
+          out="${GITHUB_WORKSPACE}/artifacts/legacy-runtime"
+          mkdir -p "${out}/root"
+          cp out/Release/node "${out}/root/node"
+          arm-linux-gnueabi-strip --strip-unneeded "${out}/root/node"
+
+          cat > "${out}/root/runtime.json" <<EOF
+          {
+            "profile": "${LEGACY_RUNTIME_PROFILE}",
+            "nodeVersion": "${NODE_RUNTIME_VERSION}",
+            "architecture": "armv7",
+            "userspaceBits": 32,
+            "floatAbi": "softfp",
+            "fpu": "vfpv3",
+            "linkage": "static",
+            "webAssembly": false,
+            "expectedElfFlags": "EABI5 soft-float",
+            "testedTargetClass": "LG webOS legacy ARM32 userspace"
+          }
+          EOF
+
+          cd "${out}"
+          runtime="node-v${NODE_RUNTIME_VERSION}-linux-armv7-softfp-static.tar.gz"
+          tar -czf "${runtime}" -C root .
+          sha256sum "${runtime}" > "${runtime}.sha256"
+
+      - name: Save compiler cache
+        if: always() && steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: legacy-node-ccache-${{ env.NODE_RUNTIME_VERSION }}-${{ github.sha }}
+
+      - name: Validate ELF ABI and runtime APIs
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          runtime="artifacts/legacy-runtime/node-v${NODE_RUNTIME_VERSION}-linux-armv7-softfp-static.tar.gz"
+          rm -rf /tmp/tailnettv-legacy-node
+          mkdir -p /tmp/tailnettv-legacy-node
+          tar -xzf "${runtime}" -C /tmp/tailnettv-legacy-node
+
+          node_bin="/tmp/tailnettv-legacy-node/node"
+
+          arm-linux-gnueabi-readelf -h "${node_bin}" | tee /tmp/node-elf-header.txt
+          grep -q "Class:.*ELF32" /tmp/node-elf-header.txt
+          grep -q "Machine:.*ARM" /tmp/node-elf-header.txt
+          grep -qi "soft-float ABI" /tmp/node-elf-header.txt
+
+          if arm-linux-gnueabi-readelf -l "${node_bin}" | grep -q "Requesting program interpreter"; then
+            echo "Legacy runtime must not depend on a target dynamic loader."
+            exit 1
+          fi
+
+          qemu-arm "${node_bin}" -e \
+            "if (process.version !== 'v${NODE_RUNTIME_VERSION}' || process.arch !== 'arm' || process.platform !== 'linux') process.exit(2); console.log(process.version, process.arch, process.platform)"
+
+          qemu-arm "${node_bin}" -e \
+            "const fs=require('node:fs/promises'); const crypto=require('node:crypto'); if(typeof fs.readFile!=='function'||typeof crypto.randomUUID!=='function') process.exit(3); console.log('modern Node API smoke: ok')"
+
+      - name: Write release manifest
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          dir="artifacts/legacy-runtime"
+          runtime="node-v${NODE_RUNTIME_VERSION}-linux-armv7-softfp-static.tar.gz"
+          sha="$(cut -d' ' -f1 "${dir}/${runtime}.sha256")"
+          revision="${{ inputs.runtime_revision }}"
+          tag="runtime-node16-arm32-softfp-${revision}"
+
+          cat > "${dir}/runtime-manifest.json" <<EOF
+          {
+            "tag": "${tag}",
+            "profile": "${LEGACY_RUNTIME_PROFILE}",
+            "nodeVersion": "${NODE_RUNTIME_VERSION}",
+            "runtimeFile": "${runtime}",
+            "sha256": "${sha}",
+            "architecture": "armv7",
+            "userspaceBits": 32,
+            "floatAbi": "softfp",
+            "fpu": "vfpv3",
+            "linkage": "static",
+            "webAssembly": false,
+            "sourceWorkflowCommit": "${GITHUB_SHA}"
+          }
+          EOF
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-v${{ env.NODE_RUNTIME_VERSION }}-linux-armv7-softfp-static
+          path: |
+            artifacts/legacy-runtime/node-v${{ env.NODE_RUNTIME_VERSION }}-linux-armv7-softfp-static.tar.gz
+            artifacts/legacy-runtime/node-v${{ env.NODE_RUNTIME_VERSION }}-linux-armv7-softfp-static.tar.gz.sha256
+            artifacts/legacy-runtime/runtime-manifest.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Publish persistent GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          dir="artifacts/legacy-runtime"
+          revision="${{ inputs.runtime_revision }}"
+          tag="runtime-node16-arm32-softfp-${revision}"
+          runtime="node-v${NODE_RUNTIME_VERSION}-linux-armv7-softfp-static.tar.gz"
+
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --target "${GITHUB_SHA}" \
+              --title "Legacy Node runtime ${NODE_RUNTIME_VERSION} ARMv7 softfp (${revision})" \
+              --notes "Fully static Node.js ${NODE_RUNTIME_VERSION} runtime for legacy LG webOS ARM32 soft-float userspace. Built with VFPv3; WebAssembly disabled. Validate on physical target hardware before integrating into an app release."
+          fi
+
+          gh release upload "${tag}" \
+            "${dir}/${runtime}" \
+            "${dir}/${runtime}.sha256" \
+            "${dir}/runtime-manifest.json" \
+            --clobber

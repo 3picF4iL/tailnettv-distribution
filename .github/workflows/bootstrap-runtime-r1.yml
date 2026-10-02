@@ -1,0 +1,88 @@
+name: Bootstrap legacy runtime r1
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/bootstrap-runtime-r1.yml"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish validated runtime r1
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download validated runtime artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/11242221128/zip" \
+            > /tmp/runtime.zip
+          unzip -q /tmp/runtime.zip -d dist
+
+          runtime="$(find dist -type f -name 'node-v16.20.2-linux-armv7-softfp-static.tar.gz' -print -quit)"
+          checksum="${runtime}.sha256"
+
+          test -n "${runtime}"
+          test -f "${checksum}"
+
+          sha="$(awk '{print $1}' "${checksum}")"
+          echo "RUNTIME_SHA256=${sha}" >> "${GITHUB_ENV}"
+          echo "::notice title=Runtime SHA256::${sha}"
+
+          cat > dist/runtime-manifest.json <<EOF
+          {
+            "tag": "runtime-node16-arm32-softfp-r1",
+            "profile": "legacy-arm32-softfp-static",
+            "nodeVersion": "16.20.2",
+            "runtimeFile": "node-v16.20.2-linux-armv7-softfp-static.tar.gz",
+            "sha256": "${sha}",
+            "architecture": "armv7",
+            "userspaceBits": 32,
+            "floatAbi": "softfp",
+            "fpu": "vfpv3",
+            "linkage": "static",
+            "webAssembly": false,
+            "sourceBuildRun": 37035919677,
+            "sourceArtifactId": 11242221128,
+            "sourceWorkflowCommit": "0a68276f2414b30cb061ee224bebe1fb1923b3db",
+            "distributionCommit": "8829dadfb3b09b04a0c01db9f56e93b218f5a040"
+          }
+          EOF
+
+      - name: Publish persistent GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="runtime-node16-arm32-softfp-r1"
+          runtime="dist/node-v16.20.2-linux-armv7-softfp-static.tar.gz"
+
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "8829dadfb3b09b04a0c01db9f56e93b218f5a040" \
+              --title "Legacy Node runtime 16.20.2 ARMv7 softfp (r1)" \
+              --notes "Validated Tailnet TV compatibility runtime: fully static ARMv7 EABI5 soft-float Node.js 16.20.2 with VFPv3 and WebAssembly disabled. The source artifact passed ELF/ABI and QEMU API validation in public workflow run 37035919677."
+          fi
+
+          gh release upload "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            "${runtime}" \
+            "${runtime}.sha256" \
+            "dist/runtime-manifest.json" \
+            --clobber

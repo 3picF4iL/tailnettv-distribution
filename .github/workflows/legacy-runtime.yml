@@ -75,14 +75,16 @@ jobs:
         if: steps.runtime-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          workdir="${GITHUB_WORKSPACE}/.work"
+          # Keep build paths short: V8 archives contain hundreds of object paths and
+          # can otherwise exceed Linux ARG_MAX when the repository name is long.
+          workdir="/tmp/tailnettv-node-build"
           rm -rf "${workdir}"
           mkdir -p "${workdir}"
 
           export CCACHE_DIR="${HOME}/.cache/ccache"
-          export CCACHE_BASEDIR="${GITHUB_WORKSPACE}"
+          export CCACHE_BASEDIR="${workdir}"
           export CCACHE_COMPILERCHECK=content
           ccache --max-size=1G
 
@@ -151,7 +153,7 @@ jobs:
             --openssl-no-asm \
             --fully-static
 
-          make -j2
+          make -j2 V=0
 
           out="${GITHUB_WORKSPACE}/artifacts/legacy-runtime"
           mkdir -p "${out}/root"

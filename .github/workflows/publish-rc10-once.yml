@@ -1,0 +1,43 @@
+name: Publish RC10 once
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/publish-rc10-once.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified build artifact
+        env:
+          ARTIFACT_URL: 'https://sdmntprnortheu.oaiusercontent.com/files/00000000-9234-81f4-96fa-1071be02ae5e/raw?se=2026-10-03T22%3A19%3A31Z&sp=r&sv=2026-02-06&sr=b&scid=dacc4746-5a08-53bb-950e-6061ead12143&skoid=9b41a688-1b44-4731-856e-b0efcf3660ed&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-10-03T06%3A08%3A54Z&ske=2026-10-04T06%3A08%3A54Z&sks=b&skv=2026-02-06&sig=6QGJNI1z19QrnuOX5iQ/mrw7Z2csCULsDr7tQrt4skc%3D'
+        run: |
+          set -euo pipefail
+          curl -fL "$ARTIFACT_URL" -o /tmp/tailnettv-rc10-build.zip
+          mkdir -p /tmp/rc10
+          unzip -q /tmp/tailnettv-rc10-build.zip -d /tmp/rc10
+
+      - name: Verify packages
+        run: |
+          set -euo pipefail
+          echo "159272c3e2fa007fb00bed757537c2135380cfebd93bbfa81b9d10676d8a1524  /tmp/rc10/legacy/dev.tailnettv.app_0.3.0_legacy.ipk" | sha256sum -c -
+          echo "7640d3f6c11011bd8b714f8054f74046245556dbb198e1d6ed4c1d66d2b5f8cd  /tmp/rc10/modern/dev.tailnettv.app_0.3.0_modern.ipk" | sha256sum -c -
+
+      - name: Publish RC10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create 0.3.0-rc.10 \
+            /tmp/rc10/legacy/dev.tailnettv.app_0.3.0_legacy.ipk \
+            /tmp/rc10/modern/dev.tailnettv.app_0.3.0_modern.ipk \
+            --repo "${{ github.repository }}" \
+            --title "Tailnet TV 0.3.0 RC10" \
+            --notes "RC10 fixes persistent Tailscale state ownership after changing subnet-route preferences, preventing AUTHENTICATED_KERNEL_STATE_UNSAFE and PROVISIONING_INVALID after disconnect." \
+            --prerelease
